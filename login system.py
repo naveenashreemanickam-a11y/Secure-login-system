@@ -1,26 +1,52 @@
-from flask import Flask, request, redirect, session
-
+import os
 import sqlite3
 import hashlib
 
-app = Flask(__name__)
-app.secret_key = "mysecretkey"
+from flask import Flask, request, redirect, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
-# Create database
-conn = sqlite3.connect("users.db")
-cur = conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users(
-    username TEXT PRIMARY KEY,
-    password TEXT
-)
-""")
-conn.commit()
-conn.close()
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "mysecretkey")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "users.db")
+
+
+def get_connection():
+    return sqlite3.connect(DATABASE_PATH)
+
+
+def init_db():
+    with get_connection() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            username TEXT PRIMARY KEY,
+            password TEXT
+        )
+        """)
+        conn.commit()
+
 
 # Hash password
 def hash_password(password):
+    return generate_password_hash(password)
+
+
+def legacy_sha256(password):
     return hashlib.sha256(password.encode()).hexdigest()
+
+
+def is_legacy_password_hash(stored_password):
+    return len(stored_password) == 64 and all(
+        character in "0123456789abcdef" for character in stored_password
+    )
+
+
+def password_matches(stored_password, submitted_password):
+    if is_legacy_password_hash(stored_password):
+        return stored_password == legacy_sha256(submitted_password)
+    return check_password_hash(stored_password, submitted_password)
+
+
+init_db()
 
 # Home
 @app.route("/")
@@ -45,14 +71,12 @@ def register():
         hashed = hash_password(password)
 
         try:
-            conn = sqlite3.connect("users.db")
-            cur = conn.cursor()
-            cur.execute("INSERT INTO users VALUES(?,?)", (username, hashed))
-            conn.commit()
-            conn.close()
-            return redirect("/login")
-        except:
+            with get_connection() as conn:
+                conn.execute("INSERT INTO users VALUES(?,?)", (username, hashed))
+                conn.commit()
+        except sqlite3.IntegrityError:
             return "Username already exists."
+        return redirect("/login")
 
     return """
     <h2>Register</h2>
@@ -72,19 +96,24 @@ def register():
 def login():
     if request.method == "POST":
         username = request.form["username"]
-        password = hash_password(request.form["password"])
+        password = request.form["password"]
 
-        conn = sqlite3.connect("users.db")
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
-        user = cur.fetchone()
-        conn.close()
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE username=?", (username,))
+            user = cur.fetchone()
 
-        if user:
-            session["user"] = username
-            return redirect("/")
-        else:
-            return "Invalid Username or Password."
+            if user and password_matches(user[1], password):
+                if is_legacy_password_hash(user[1]):
+                    conn.execute(
+                        "UPDATE users SET password=? WHERE username=?",
+                        (hash_password(password), username),
+                    )
+                    conn.commit()
+                session["user"] = username
+                return redirect("/")
+
+        return "Invalid Username or Password."
 
     return """
     <h2>Login</h2>
